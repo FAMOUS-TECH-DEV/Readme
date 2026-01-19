@@ -91,7 +91,7 @@ const question = text => new Promise(resolve => rl.question(text, resolve))
    UPDATE FUNCTION
 ========================= */
 async function updateSparkJs() {
-  const githubRawUrl = '' // PUT YOUR RAW GITHUB URL HERE
+  const githubRawUrl = 'https://raw.githubusercontent.com/FAMOUS-TECH-DEV/Readme/refs/heads/main/Readme' // PUT YOUR RAW GITHUB URL HERE
   const localFilePath = './leesha.js'
 
   console.log(chalk.blue('[ INSTALLING ] SHADØW-XMD 📥'))
