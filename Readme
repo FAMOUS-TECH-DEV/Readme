@@ -1,0 +1,480 @@
+'use strict'
+
+/* =========================
+   CORE IMPORTS
+========================= */
+require('./lib/lowdb/adapters/settings')
+
+const fs = require('fs')
+const path = require('path')
+const axios = require('axios')
+const pino = require('pino')
+const chalk = require('chalk')
+const readline = require('readline')
+const NodeCache = require('node-cache')
+const moment = require('moment-timezone')
+const colors = require('colors')
+const cfonts = require('cfonts')
+
+const { Boom } = require('@hapi/boom')
+
+/* =========================
+   BAILEYS IMPORTS
+========================= */
+const {
+  default: XeonBotIncConnect,
+  PHONENUMBER_MCC,
+  DisconnectReason,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  jidDecode,
+  getAggregateVotesInPollMessage,
+  delay
+} = require('baileys')
+
+const { makeInMemoryStore } = require('baileys')
+
+/* =========================
+   LOCAL LIBS
+========================= */
+const { color } = require('./lib/color')
+const { start } = require('./lib/spinner')
+const { nocache } = require('./lib/loader')
+const { smsg, sleep, getBuffer } = require('./lib/myfunc')
+const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
+
+const {
+  loadBotSettings,
+  saveBotSettings,
+  markBotLinked,
+  getAutoViewStatus,
+  hasConnectionMessageBeenSent,
+  getBotJid
+} = require('./lib/uptime')
+
+/* =========================
+   GLOBAL DATABASE
+========================= */
+global.db = JSON.parse(fs.readFileSync('./database/database.json'))
+global.db = {
+  users: {},
+  chats: {},
+  settings: {},
+  ...(global.db || {})
+}
+
+global.sessionName = 'session'
+global.prefix = '.'
+
+/* =========================
+   OWNER & WELCOME DATA
+========================= */
+const owner = JSON.parse(fs.readFileSync('./database/owner.json'))
+const _welcome = JSON.parse(fs.readFileSync('./database/welcome.json'))
+const _left = JSON.parse(fs.readFileSync('./database/left.json'))
+
+/* =========================
+   STORE & INPUT
+========================= */
+const store = makeInMemoryStore({
+  logger: pino().child({ level: 'silent', stream: 'store' })
+})
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+})
+
+const question = text => new Promise(resolve => rl.question(text, resolve))
+
+/* =========================
+   UPDATE FUNCTION
+========================= */
+async function updateSparkJs() {
+  const githubRawUrl = '' // PUT YOUR RAW GITHUB URL HERE
+  const localFilePath = './leesha.js'
+
+  console.log(chalk.blue('[ INSTALLING ] SHADØW-XMD 📥'))
+
+  try {
+    const { data } = await axios.get(githubRawUrl)
+    if (!fs.existsSync(localFilePath) || fs.readFileSync(localFilePath, 'utf8') !== data) {
+      fs.writeFileSync(localFilePath, data)
+      console.log(chalk.green('[ UPDATED ] SHADØW-XMD ✅'))
+    } else {
+      console.log(chalk.gray('[ NO CHANGES ]'))
+    }
+  } catch (err) {
+    console.error('Update error:', err.message)
+  }
+}
+/* =========================
+   MAIN BOT FUNCTION
+========================= */
+async function LordVoltageInd() {
+  try {
+    /* ===== UPDATE & LOAD CORE FILE ===== */
+    await updateSparkJs()
+    require('./leesha.js')
+    nocache('../leesha.js', m => console.log(color('[ UPDATE ]', 'cyan'), m))
+
+    /* ===== LOAD SETTINGS ===== */
+    await loadBotSettings()
+
+    const { state, saveCreds } = await useMultiFileAuthState(`./${sessionName}`)
+    const msgRetryCounterCache = new NodeCache()
+
+    /* ===== INIT CLIENT ===== */
+    const LordVoltage = XeonBotIncConnect({
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: !process.argv.includes('--pairing-code'),
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(
+          state.keys,
+          pino({ level: 'fatal' }).child({ level: 'fatal' })
+        )
+      },
+      browser: ['MacOS', 'Safari', '10.15.7'],
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      markOnlineOnConnect: true,
+      msgRetryCounterCache,
+      getMessage: async key => {
+        if (store) {
+          const msg = await store.loadMessage(key.remoteJid, key.id)
+          return msg?.message
+        }
+        return { conversation: 'SHADØW-XMD' }
+      }
+    })
+
+    store.bind(LordVoltage.ev)
+    LordVoltage.ev.on('creds.update', saveCreds)
+
+    /* ===== MARK BOT LINKED ===== */
+    await markBotLinked()
+
+    /* =========================
+       CONNECTION UPDATE
+    ========================= */
+    LordVoltage.ev.on('connection.update', async update => {
+      const { connection, lastDisconnect } = update
+
+      if (connection === 'close') {
+        const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+        console.log(chalk.red('❌ Connection closed:'), reason)
+
+        switch (reason) {
+          case DisconnectReason.loggedOut:
+            console.log('❗ Logged out. Delete session and re-pair.')
+            process.exit(0)
+            break
+          default:
+            console.log('🔄 Reconnecting...')
+            await delay(2000)
+            LordVoltageInd()
+        }
+      }
+
+      if (connection === 'open') {
+        console.log(chalk.green('✅ SHADØW-XMD CONNECTED'))
+
+        /* ===== PAIRING CODE ===== */
+        const pairingCode = process.argv.includes('--pairing-code')
+        if (pairingCode && !LordVoltage.authState.creds.registered) {
+          let phoneNumber = await question(
+            chalk.bgBlack(chalk.greenBright('Enter WhatsApp number (with country code): '))
+          )
+
+          phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
+
+          while (!Object.keys(PHONENUMBER_MCC).some(v => phoneNumber.startsWith(v))) {
+            console.log(chalk.red('❌ Invalid country code'))
+            phoneNumber = await question(chalk.green('Try again: '))
+            phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
+          }
+
+          try {
+            const code = await LordVoltage.requestPairingCode(phoneNumber)
+            console.log(
+              chalk.cyan('🔑 Pairing Code:'),
+              chalk.yellow(code.match(/.{1,4}/g).join('-'))
+            )
+          } catch (err) {
+            console.error('Pairing error:', err.message)
+          }
+        }
+      }
+    })
+
+    /* =========================
+       RETURN INSTANCE
+    ========================= */
+    return LordVoltage
+
+  } catch (err) {
+    console.error('INIT ERROR:', err)
+  }
+}
+/* =========================
+   START BOT
+========================= */
+LordVoltageInd()
+
+/* =========================
+   MESSAGE HANDLER
+========================= */
+function registerEvents(LordVoltage) {
+
+  /* ===== MESSAGES ===== */
+  LordVoltage.ev.on('messages.upsert', async chatUpdate => {
+    try {
+      const msg = chatUpdate.messages[0]
+      if (!msg || !msg.message) return
+
+      msg.message =
+        Object.keys(msg.message)[0] === 'ephemeralMessage'
+          ? msg.message.ephemeralMessage.message
+          : msg.message
+
+      // Auto view status
+      if (
+        msg.key.remoteJid === 'status@broadcast' &&
+        getAutoViewStatus()
+      ) {
+        await LordVoltage.readMessages([msg.key])
+      }
+
+      if (!LordVoltage.public && !msg.key.fromMe) return
+
+      const m = smsg(LordVoltage, msg, store)
+      require('./shadow')(LordVoltage, m, chatUpdate, store)
+
+    } catch (err) {
+      console.error('Message error:', err)
+    }
+  })
+
+  /* ===== GROUP PARTICIPANTS ===== */
+  LordVoltage.ev.on('group-participants.update', async anu => {
+    try {
+      const { welcome } = require('./lib/welcome')
+      const isWel = _welcome.includes(anu.id)
+      const isLeft = _left.includes(anu.id)
+      welcome(isWel, isLeft, LordVoltage, anu)
+    } catch (err) {
+      console.error('Group error:', err)
+    }
+  })
+
+  /* ===== CALL ANTI ===== */
+  LordVoltage.ev.on('call', async calls => {
+    try {
+      const botNumber = LordVoltage.decodeJid(LordVoltage.user.id)
+      const anticall = global.db.settings?.[botNumber]?.anticall
+      if (!anticall) return
+
+      for (const call of calls) {
+        if (call.isGroup) continue
+        if (call.status === 'offer') {
+          await LordVoltage.sendMessage(call.from, {
+            text: `📵 Calls are disabled.\nYou will be blocked.`
+          })
+          await sleep(5000)
+          await LordVoltage.updateBlockStatus(call.from, 'block')
+        }
+      }
+    } catch (err) {
+      console.error('Call error:', err)
+    }
+  })
+
+  /* ===== POLL HANDLER ===== */
+  async function getMessage(key) {
+    if (store) {
+      const msg = await store.loadMessage(key.remoteJid, key.id)
+      return msg?.message
+    }
+    return { conversation: 'SHADØW-XMD' }
+  }
+
+  LordVoltage.ev.on('messages.update', async updates => {
+    try {
+      for (const { key, update } of updates) {
+        if (update.pollUpdates && key.fromMe) {
+          const pollMsg = await getMessage(key)
+          if (!pollMsg) continue
+
+          const poll = await getAggregateVotesInPollMessage({
+            message: pollMsg,
+            pollUpdates: update.pollUpdates
+          })
+
+          const cmd = poll
+            .filter(v => v.voters.length > 0)[0]?.name
+
+          if (!cmd) return
+          LordVoltage.appendTextMessage(prefix + cmd, updates)
+        }
+      }
+    } catch (err) {
+      console.error('Poll error:', err)
+    }
+  })
+
+  /* ===== CONTACT UPDATE ===== */
+  LordVoltage.ev.on('contacts.update', update => {
+    for (const contact of update) {
+      const id = LordVoltage.decodeJid(contact.id)
+      if (store.contacts) {
+        store.contacts[id] = {
+          id,
+          name: contact.notify
+        }
+      }
+    }
+  })
+}
+
+/* =========================
+   UTIL HELPERS
+========================= */
+function setupUtils(LordVoltage) {
+
+  LordVoltage.decodeJid = jid => {
+    if (!jid) return jid
+    if (/:\d+@/gi.test(jid)) {
+      const d = jidDecode(jid) || {}
+      return (d.user && d.server && d.user + '@' + d.server) || jid
+    }
+    return jid
+  }
+
+  LordVoltage.sendTextWithMentions = async (jid, text, quoted, options = {}) =>
+    LordVoltage.sendMessage(
+      jid,
+      {
+        text,
+        contextInfo: {
+          mentionedJid: [...text.matchAll(/@(\d{5,16})/g)].map(
+            v => v[1] + '@s.whatsapp.net'
+          )
+        },
+        ...options
+      },
+      { quoted }
+    )
+
+  LordVoltage.public = true
+}
+/* =========================
+   MEDIA HELPERS
+========================= */
+function setupMedia(LordVoltage) {
+
+  LordVoltage.sendImage = async (jid, img, caption = '', quoted = null, options = {}) => {
+    const buffer = Buffer.isBuffer(img)
+      ? img
+      : /^https?:\/\//.test(img)
+        ? await getBuffer(img)
+        : fs.existsSync(img)
+          ? fs.readFileSync(img)
+          : Buffer.alloc(0)
+
+    return LordVoltage.sendMessage(
+      jid,
+      { image: buffer, caption, ...options },
+      { quoted }
+    )
+  }
+
+  LordVoltage.sendImageAsSticker = async (jid, img, quoted, options = {}) => {
+    const buffer = Buffer.isBuffer(img)
+      ? img
+      : /^https?:\/\//.test(img)
+        ? await getBuffer(img)
+        : fs.existsSync(img)
+          ? fs.readFileSync(img)
+          : Buffer.alloc(0)
+
+    const sticker = options.packname || options.author
+      ? await writeExifImg(buffer, options)
+      : await imageToWebp(buffer)
+
+    await LordVoltage.sendMessage(jid, { sticker: { url: sticker } }, { quoted })
+    fs.unlinkSync(sticker)
+  }
+
+  LordVoltage.sendVideoAsSticker = async (jid, vid, quoted, options = {}) => {
+    const buffer = Buffer.isBuffer(vid)
+      ? vid
+      : /^https?:\/\//.test(vid)
+        ? await getBuffer(vid)
+        : fs.existsSync(vid)
+          ? fs.readFileSync(vid)
+          : Buffer.alloc(0)
+
+    const sticker = options.packname || options.author
+      ? await writeExifVid(buffer, options)
+      : await videoToWebp(buffer)
+
+    await LordVoltage.sendMessage(jid, { sticker: { url: sticker } }, { quoted })
+    fs.unlinkSync(sticker)
+  }
+}
+
+/* =========================
+   STATUS SETTER
+========================= */
+function setupStatus(LordVoltage) {
+  LordVoltage.setStatus = async status => {
+    await LordVoltage.query({
+      tag: 'iq',
+      attrs: {
+        to: '@s.whatsapp.net',
+        type: 'set',
+        xmlns: 'status'
+      },
+      content: [
+        {
+          tag: 'status',
+          attrs: {},
+          content: Buffer.from(status, 'utf-8')
+        }
+      ]
+    })
+    return status
+  }
+}
+
+/* =========================
+   FINAL INITIALIZER
+========================= */
+async function startBot() {
+  const LordVoltage = await LordVoltageInd()
+  if (!LordVoltage) return
+
+  setupUtils(LordVoltage)
+  setupMedia(LordVoltage)
+  setupStatus(LordVoltage)
+  registerEvents(LordVoltage)
+
+  start('2', colors.bold.green('\nSHADØW-XMD READY\n'))
+}
+
+/* =========================
+   RUN BOT
+========================= */
+startBot()
+
+/* =========================
+   SAFETY NET
+========================= */
+process.on('uncaughtException', err => {
+  console.error('UNCAUGHT EXCEPTION:', err)
+})
+
+process.on('unhandledRejection', err => {
+  console.error('UNHANDLED PROMISE:', err)
+})
